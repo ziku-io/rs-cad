@@ -148,6 +148,83 @@ fn resource_key(value: &str) -> Option<&str> {
         .strip_suffix('}')
 }
 
+#[derive(Clone)]
+enum Paint {
+    Color(String),
+    ImageBrush {
+        data: String,
+        transform: String,
+        width: String,
+        height: String,
+    },
+}
+
+fn deobfuscate_font(mut bytes: Vec<u8>, file: &str) -> Option<Vec<u8>> {
+    let guid = file.strip_suffix(".odttf")?.replace('-', "");
+    if guid.len() != 32 || bytes.len() < 32 {
+        return None;
+    }
+    let mut key = [0_u8; 16];
+    for (index, byte) in key.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&guid[index * 2..index * 2 + 2], 16).ok()?;
+    }
+    key.reverse();
+    for (index, byte) in bytes.iter_mut().take(32).enumerate() {
+        *byte ^= key[index % key.len()];
+    }
+    Some(bytes)
+}
+
+fn attribute(xml: &str, name: &str) -> Option<String> {
+    xml.split(&format!("{name}=\""))
+        .nth(1)?
+        .split('"')
+        .next()
+        .map(str::to_owned)
+}
+
+fn unresolved_resource(
+    paints: &std::collections::HashMap<String, Paint>,
+    raw: Option<&str>,
+) -> bool {
+    raw.and_then(resource_key)
+        .is_some_and(|key| !paints.contains_key(key))
+}
+
+fn paint(
+    defs: &mut String,
+    paints: &std::collections::HashMap<String, Paint>,
+    raw: Option<String>,
+    prefix: &str,
+    next_id: &mut usize,
+) -> String {
+    let Some(raw) = raw else {
+        return "none".to_owned();
+    };
+    let Some(key) = resource_key(&raw) else {
+        return if raw.starts_with('{') {
+            "none".to_owned()
+        } else {
+            raw
+        };
+    };
+    match paints.get(key) {
+        Some(Paint::Color(value)) => value.clone(),
+        Some(Paint::ImageBrush {
+            data,
+            transform,
+            width,
+            height,
+        }) => {
+            *next_id += 1;
+            let id = format!("rs-cad-{prefix}-{next_id}");
+            writeln!(defs, "<pattern id=\"{id}\" patternUnits=\"userSpaceOnUse\" width=\"{}\" height=\"{}\" patternTransform=\"{}\"><image href=\"{}\" width=\"{}\" height=\"{}\"/></pattern>", escape(width), escape(height), escape(transform), data, escape(width), escape(height)).unwrap();
+            format!("url(#{id})")
+        }
+        None => "none".to_owned(),
+    }
+}
+
 fn normalize(base: &str, source: &str) -> Option<String> {
     let mut parts: Vec<&str> = if source.starts_with('/') {
         Vec::new()
@@ -247,7 +324,69 @@ pub fn render_dwfx_page<R: Read + Seek>(
         .by_name(&page_path)?
         .read_to_string(&mut page)
         .map_err(|_| Error::MissingFixedPage)?;
-    let mut paints = std::collections::HashMap::new();
+    let mut paints: std::collections::HashMap<String, Paint> = std::collections::HashMap::new();
+    let mut fonts: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut font_faces: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let page_dir = page_path
+        .rsplit_once('/')
+        .map(|(dir, _)| dir)
+        .unwrap_or_default();
+    let extension_parts: Vec<String> = (0..archive.len())
+        .filter_map(|index| {
+            let entry = archive.by_index(index).ok()?;
+            (entry.name().starts_with(page_dir)
+                && entry.name().ends_with(".xml")
+                && !entry.name().ends_with("FixedPage.fpage"))
+            .then(|| entry.name().to_owned())
+        })
+        .collect();
+    for part in extension_parts {
+        let mut xml = String::new();
+        if archive
+            .by_name(&part)
+            .and_then(|mut entry| {
+                entry
+                    .read_to_string(&mut xml)
+                    .map_err(zip::result::ZipError::Io)
+            })
+            .is_err()
+        {
+            continue;
+        }
+        for font in xml.split("<Font ").skip(1) {
+            if let (Some(name), Some(uri)) = (attribute(font, "Name"), attribute(font, "FontUri"))
+                && let Some(file) = uri.rsplit('/').next()
+            {
+                let path = normalize(&part, file).unwrap_or_default();
+                if let Ok(mut entry) = archive.by_name(&path)
+                    && entry.size() <= MAX_ENTRY_BYTES
+                {
+                    let mut bytes = Vec::new();
+                    if entry.read_to_end(&mut bytes).is_ok()
+                        && let Some(bytes) = deobfuscate_font(bytes, file)
+                    {
+                        let data = format!(
+                            "data:font/ttf;base64,{}",
+                            base64::Engine::encode(
+                                &base64::engine::general_purpose::STANDARD,
+                                bytes
+                            )
+                        );
+                        font_faces.insert(
+                            file.to_owned(),
+                            format!(
+                                "@font-face{{font-family:'{}';src:url('{}')}}",
+                                escape(&name),
+                                data
+                            ),
+                        );
+                    }
+                }
+                fonts.insert(file.to_owned(), name);
+            }
+        }
+    }
     for source in sources(&page, "ResourceDictionary") {
         let Some(resource_path) = normalize(&page_path, &source) else {
             continue;
@@ -260,21 +399,55 @@ pub fn render_dwfx_page<R: Read + Seek>(
                     .read_to_string(&mut dictionary)
                     .map_err(zip::result::ZipError::Io)
             })
-            .is_ok()
+            .is_err()
         {
-            for color in dictionary.split("<SolidColorBrush").skip(1) {
-                let key = color
-                    .split("x:Key=\"")
-                    .nth(1)
-                    .and_then(|tail| tail.split('"').next());
-                let value = color
-                    .split("Color=\"")
-                    .nth(1)
-                    .and_then(|tail| tail.split('"').next());
-                if let (Some(key), Some(value)) = (key, value) {
-                    paints.insert(key.to_owned(), value.to_owned());
-                }
+            continue;
+        }
+        for color in dictionary.split("<SolidColorBrush").skip(1) {
+            if let (Some(key), Some(value)) = (attribute(color, "x:Key"), attribute(color, "Color"))
+            {
+                paints.insert(key, Paint::Color(value));
             }
+        }
+        for brush in dictionary.split("<ImageBrush").skip(1) {
+            let Some(key) = attribute(brush, "x:Key") else {
+                continue;
+            };
+            let Some(image_source) =
+                attribute(brush, "ImageSource").and_then(|path| normalize(&resource_path, &path))
+            else {
+                continue;
+            };
+            let Ok(mut image) = archive.by_name(&image_source) else {
+                continue;
+            };
+            if image.size() > MAX_ENTRY_BYTES {
+                continue;
+            }
+            let mut bytes = Vec::new();
+            if image.read_to_end(&mut bytes).is_err() {
+                continue;
+            }
+            let data = format!(
+                "data:image/jpeg;base64,{}",
+                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes)
+            );
+            let transform = attribute(brush, "Transform")
+                .and_then(|value| xps_transform(Some(value)))
+                .unwrap_or_default();
+            let viewport = attribute(brush, "Viewport").unwrap_or_else(|| "0,0,140,125".to_owned());
+            let dimensions: Vec<&str> = viewport.split(',').map(str::trim).collect();
+            let width = dimensions.get(2).unwrap_or(&"140").to_string();
+            let height = dimensions.get(3).unwrap_or(&"125").to_string();
+            paints.insert(
+                key,
+                Paint::ImageBrush {
+                    data,
+                    transform,
+                    width,
+                    height,
+                },
+            );
         }
     }
 
@@ -290,6 +463,9 @@ pub fn render_dwfx_page<R: Read + Seek>(
     let mut depth = 0_usize;
     let mut text = Vec::new();
     let mut unresolved_resources = 0_usize;
+    let mut unresolved_clips = 0_usize;
+    let mut clip_id = 0_usize;
+    let mut defs = String::new();
     let mut svg = String::new();
     let mut initialized = false;
 
@@ -310,7 +486,21 @@ pub fn render_dwfx_page<R: Read + Seek>(
                         let transform =
                             xps_transform(attr(&event, b"RenderTransform")?).unwrap_or_default();
                         let clip = attr(&event, b"Clip")?
-                            .map(|value| format!(" data-rs-cad-clip=\"{}\"", escape(&value)))
+                            .and_then(|value| {
+                                if resource_key(&value).is_some() {
+                                    unresolved_clips += 1;
+                                    return None;
+                                }
+                                clip_id += 1;
+                                let id = format!("rs-cad-clip-{clip_id}");
+                                writeln!(
+                                    defs,
+                                    "<clipPath id=\"{id}\"><path d=\"{}\"/></clipPath>",
+                                    escape(&value)
+                                )
+                                .unwrap();
+                                Some(format!(" clip-path=\"url(#{id})\""))
+                            })
                             .unwrap_or_default();
                         if transform.is_empty() {
                             writeln!(svg, "<g{clip}>").unwrap();
@@ -330,39 +520,20 @@ pub fn render_dwfx_page<R: Read + Seek>(
                         let raw_fill = attr(&event, b"Fill")?;
                         let raw_stroke = attr(&event, b"Stroke")?;
                         unresolved_resources +=
-                            usize::from(raw_fill.as_deref().is_some_and(|paint| {
-                                paint.starts_with("{StaticResource")
-                                    || paint.starts_with("{DynamicResource")
-                            }));
+                            usize::from(unresolved_resource(&paints, raw_fill.as_deref()));
                         unresolved_resources +=
-                            usize::from(raw_stroke.as_deref().is_some_and(|paint| {
-                                paint.starts_with("{StaticResource")
-                                    || paint.starts_with("{DynamicResource")
-                            }));
-                        let fill = raw_fill
-                            .as_deref()
-                            .and_then(|paint| {
-                                resource_key(paint)
-                                    .and_then(|key| paints.get(key))
-                                    .cloned()
-                                    .or_else(|| (!paint.starts_with('{')).then(|| paint.to_owned()))
-                            })
-                            .unwrap_or_else(|| "none".to_owned());
-                        let stroke = raw_stroke
-                            .as_deref()
-                            .and_then(|paint| {
-                                resource_key(paint)
-                                    .and_then(|key| paints.get(key))
-                                    .cloned()
-                                    .or_else(|| (!paint.starts_with('{')).then(|| paint.to_owned()))
-                            })
-                            .unwrap_or_else(|| "none".to_owned());
+                            usize::from(unresolved_resource(&paints, raw_stroke.as_deref()));
+                        let fill = paint(&mut defs, &paints, raw_fill, "fill", &mut clip_id);
+                        let stroke = paint(&mut defs, &paints, raw_stroke, "stroke", &mut clip_id);
                         let transform =
                             xps_transform(attr(&event, b"RenderTransform")?).unwrap_or_default();
+                        let stroke_width =
+                            attr(&event, b"StrokeThickness")?.unwrap_or_else(|| "1".to_owned());
+                        let opacity = attr(&event, b"Opacity")?.unwrap_or_else(|| "1".to_owned());
                         if transform.is_empty() {
-                            writeln!(svg, "<path d=\"{}\" fill=\"{}\" stroke=\"{}\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>", escape(&data), escape(&fill), escape(&stroke)).unwrap();
+                            writeln!(svg, "<path d=\"{}\" fill=\"{}\" stroke=\"{}\" stroke-width=\"{}\" opacity=\"{}\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>", escape(&data), escape(&fill), escape(&stroke), escape(&stroke_width), escape(&opacity)).unwrap();
                         } else {
-                            writeln!(svg, "<path d=\"{}\" fill=\"{}\" stroke=\"{}\" stroke-linecap=\"round\" stroke-linejoin=\"round\" transform=\"{}\"/>", escape(&data), escape(&fill), escape(&stroke), transform).unwrap();
+                            writeln!(svg, "<path d=\"{}\" fill=\"{}\" stroke=\"{}\" stroke-width=\"{}\" opacity=\"{}\" stroke-linecap=\"round\" stroke-linejoin=\"round\" transform=\"{}\"/>", escape(&data), escape(&fill), escape(&stroke), escape(&stroke_width), escape(&opacity), transform).unwrap();
                         }
                     }
                     b"Glyphs" if initialized => {
@@ -373,13 +544,25 @@ pub fn render_dwfx_page<R: Read + Seek>(
                         let origin_y = attr(&event, b"OriginY")?.unwrap_or_else(|| "0".to_owned());
                         let size = attr(&event, b"FontRenderingEmSize")?
                             .unwrap_or_else(|| "12".to_owned());
-                        let fill = attr(&event, b"Fill")?.unwrap_or_else(|| "#000000".to_owned());
+                        let raw_fill = attr(&event, b"Fill")?;
+                        unresolved_resources +=
+                            usize::from(unresolved_resource(&paints, raw_fill.as_deref()));
+                        let fill = paint(&mut defs, &paints, raw_fill, "glyph-fill", &mut clip_id);
                         let transform =
                             xps_transform(attr(&event, b"RenderTransform")?).unwrap_or_default();
+                        let family = attr(&event, b"FontUri")?
+                            .and_then(|uri| {
+                                uri.rsplit('/')
+                                    .next()
+                                    .and_then(|file| fonts.get(file))
+                                    .cloned()
+                            })
+                            .unwrap_or_else(|| "sans-serif".to_owned());
+                        let opacity = attr(&event, b"Opacity")?.unwrap_or_else(|| "1".to_owned());
                         if transform.is_empty() {
-                            writeln!(svg, "<text x=\"{}\" y=\"{}\" font-size=\"{}\" fill=\"{}\" font-family=\"sans-serif\">{}</text>", escape(&origin_x), escape(&origin_y), escape(&size), escape(&fill), escape(&value)).unwrap();
+                            writeln!(svg, "<text x=\"{}\" y=\"{}\" font-size=\"{}\" fill=\"{}\" opacity=\"{}\" font-family=\"{}\">{}</text>", escape(&origin_x), escape(&origin_y), escape(&size), escape(&fill), escape(&opacity), escape(&family), escape(&value)).unwrap();
                         } else {
-                            writeln!(svg, "<text x=\"{}\" y=\"{}\" font-size=\"{}\" fill=\"{}\" font-family=\"sans-serif\" transform=\"{}\">{}</text>", escape(&origin_x), escape(&origin_y), escape(&size), escape(&fill), transform, escape(&value)).unwrap();
+                            writeln!(svg, "<text x=\"{}\" y=\"{}\" font-size=\"{}\" fill=\"{}\" opacity=\"{}\" font-family=\"{}\" transform=\"{}\">{}</text>", escape(&origin_x), escape(&origin_y), escape(&size), escape(&fill), escape(&opacity), escape(&family), transform, escape(&value)).unwrap();
                         }
                         if !value.is_empty() {
                             text.push(value);
@@ -403,6 +586,17 @@ pub fn render_dwfx_page<R: Read + Seek>(
         }
         buffer.clear();
     }
+    if !font_faces.is_empty() {
+        writeln!(
+            defs,
+            "<style>{}</style>",
+            font_faces.values().cloned().collect::<String>()
+        )
+        .unwrap();
+    }
+    if !defs.is_empty() {
+        svg = svg.replacen("><rect", &format!("><defs>{defs}</defs><rect"), 1);
+    }
     svg.push_str("</svg>\n");
     Ok((
         Inspection {
@@ -419,6 +613,11 @@ pub fn render_dwfx_page<R: Read + Seek>(
                 if unresolved_resources > 0 {
                     warnings.push(format!(
                         "{unresolved_resources} XPS resource paint references are not rendered"
+                    ));
+                }
+                if unresolved_clips > 0 {
+                    warnings.push(format!(
+                        "{unresolved_clips} XPS resource clip references are not rendered"
                     ));
                 }
                 warnings
@@ -480,12 +679,30 @@ mod tests {
                 zip::write::SimpleFileOptions::default(),
             )
             .unwrap();
-        writer.write_all(br##"<FixedPage Width="100" Height="50"><Canvas RenderTransform="1,0,0,1,2,3"><Path Data="M0,0 L10,10 Z" Fill="#000000"/><Glyphs UnicodeString="QEE" OriginX="5" OriginY="10" FontRenderingEmSize="8"/></Canvas></FixedPage>"##).unwrap();
+        writer.write_all(br##"<FixedPage Width="100" Height="50"><Canvas RenderTransform="2,0,0,2,2,3"><Path Data="M0,0 L10,10 Z" Fill="#000000" Stroke="#000000" StrokeThickness="2"/><Glyphs UnicodeString="QEE" OriginX="5" OriginY="10" FontRenderingEmSize="8"/></Canvas></FixedPage>"##).unwrap();
         let bytes = writer.finish().unwrap().into_inner();
         let (inspection, svg) = render_dwfx(Cursor::new(bytes)).unwrap();
         assert_eq!(inspection.paths, 1);
         assert_eq!(inspection.glyphs, 1);
         assert!(svg.contains("QEE"));
         assert!(svg.contains("M0,0 L10,10 Z"));
+        assert!(svg.contains("stroke-width=\"2\""));
+        assert!(!svg.contains("vector-effect"));
+    }
+
+    #[test]
+    fn rejects_unresolved_resource_paint() {
+        let mut defs = String::new();
+        let paints = std::collections::HashMap::new();
+        assert_eq!(
+            paint(
+                &mut defs,
+                &paints,
+                Some("{StaticResource Missing}".to_owned()),
+                "fill",
+                &mut 0,
+            ),
+            "none"
+        );
     }
 }

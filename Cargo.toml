@@ -12,6 +12,7 @@ thiserror = "2"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 resvg = { version = "0.48", default-features = false, features = ["text"] }
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
+base64 = "0.22"
 
 [lints.rust]
 unsafe_code = "forbid"
