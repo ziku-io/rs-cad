@@ -1,0 +1,17 @@
+[package]
+name = "rs-cad"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Read-only CAD inspection and SVG rendering"
+repository = "https://github.com/ziku-io/rs-cad"
+
+[dependencies]
+quick-xml = "0.37"
+thiserror = "2"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+resvg = { version = "0.48", default-features = false, features = ["text"] }
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+
+[lints.rust]
+unsafe_code = "forbid"
