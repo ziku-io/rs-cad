@@ -2,7 +2,8 @@ use image::{ImageBuffer, Rgb};
 use resvg::{tiny_skia, usvg};
 use thiserror::Error;
 
-const MAX_EDGE: u32 = 2048;
+pub const DEFAULT_MAX_EDGE: u32 = 2048;
+const MAX_EDGE: u32 = 4096;
 const MAX_PIXELS: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,6 +14,8 @@ pub enum Format {
 
 #[derive(Debug, Error)]
 pub enum Error {
+    #[error("raster edge must be between 1 and {MAX_EDGE} pixels")]
+    Edge,
     #[error("SVG has invalid dimensions")]
     Dimensions,
     #[error("raster dimensions exceed the configured limit")]
@@ -24,6 +27,13 @@ pub enum Error {
 }
 
 pub fn render(svg: &str, format: Format) -> Result<Vec<u8>, Error> {
+    render_with_max_edge(svg, format, DEFAULT_MAX_EDGE)
+}
+
+pub fn render_with_max_edge(svg: &str, format: Format, max_edge: u32) -> Result<Vec<u8>, Error> {
+    if max_edge == 0 || max_edge > MAX_EDGE {
+        return Err(Error::Edge);
+    }
     let options = usvg::Options::default();
     let tree = usvg::Tree::from_str(svg, &options).map_err(|_| Error::Render)?;
     let size = tree.size();
@@ -32,7 +42,7 @@ pub fn render(svg: &str, format: Format) -> Result<Vec<u8>, Error> {
     if width == 0 || height == 0 {
         return Err(Error::Dimensions);
     }
-    let scale = (MAX_EDGE as f32 / width.max(height) as f32).min(1.0);
+    let scale = (max_edge as f32 / width.max(height) as f32).min(1.0);
     let width = (width as f32 * scale).ceil() as u32;
     let height = (height as f32 * scale).ceil() as u32;
     if u64::from(width) * u64::from(height) > MAX_PIXELS {
@@ -67,5 +77,22 @@ pub fn render(svg: &str, format: Format) -> Result<Vec<u8>, Error> {
             ))?;
             Ok(out.into_inner())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_invalid_max_edge() {
+        assert!(matches!(
+            render_with_max_edge("<svg/>", Format::Png, 0),
+            Err(Error::Edge)
+        ));
+        assert!(matches!(
+            render_with_max_edge("<svg/>", Format::Png, MAX_EDGE + 1),
+            Err(Error::Edge)
+        ));
     }
 }

@@ -13,7 +13,7 @@ enum Output {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: rs-cad <inspect|render> INPUT [--page N] [--output DIRECTORY] [--format svg|png|jpeg]"
+        "usage: rs-cad <inspect|render> INPUT [--page N] [--output DIRECTORY] [--format svg|png|jpeg] [--max-edge PX]"
     );
     std::process::exit(2)
 }
@@ -43,10 +43,12 @@ fn raster_format(output: Output) -> Option<raster::Format> {
     }
 }
 
-fn encode(svg: String, output: Output) -> Result<Vec<u8>, String> {
+fn encode(svg: String, output: Output, max_edge: u32) -> Result<Vec<u8>, String> {
     match raster_format(output) {
         None => Ok(svg.into_bytes()),
-        Some(format) => raster::render(&svg, format).map_err(|error| error.to_string()),
+        Some(format) => {
+            raster::render_with_max_edge(&svg, format, max_edge).map_err(|error| error.to_string())
+        }
     }
 }
 
@@ -57,6 +59,7 @@ fn main() {
     let mut page = None;
     let mut output_dir_arg = None;
     let mut output = Output::Png;
+    let mut max_edge = raster::DEFAULT_MAX_EDGE;
     while let Some(flag) = args.next() {
         match flag.to_string_lossy().as_ref() {
             "--page" => {
@@ -73,6 +76,16 @@ fn main() {
             }
             "--output" => {
                 output_dir_arg = Some(PathBuf::from(args.next().unwrap_or_else(|| usage())))
+            }
+            "--max-edge" => {
+                max_edge = args
+                    .next()
+                    .unwrap_or_else(|| usage())
+                    .to_string_lossy()
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|edge| *edge > 0)
+                    .unwrap_or_else(|| usage())
             }
             "--format" => {
                 output = match args
@@ -174,7 +187,7 @@ fn main() {
                         directory.join(format!("page-{:03}.{}", index + 1, extension(output)));
                     (
                         path,
-                        encode(svg, output).unwrap_or_else(|error| fail(error)),
+                        encode(svg, output, max_edge).unwrap_or_else(|error| fail(error)),
                     )
                 })
                 .collect();
