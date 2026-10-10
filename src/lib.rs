@@ -290,6 +290,8 @@ pub fn render_dwfx_page<R: Read + Seek>(
     let mut depth = 0_usize;
     let mut text = Vec::new();
     let mut unresolved_resources = 0_usize;
+    let mut clip_id = 0_usize;
+    let mut defs = String::new();
     let mut svg = String::new();
     let mut initialized = false;
 
@@ -310,7 +312,17 @@ pub fn render_dwfx_page<R: Read + Seek>(
                         let transform =
                             xps_transform(attr(&event, b"RenderTransform")?).unwrap_or_default();
                         let clip = attr(&event, b"Clip")?
-                            .map(|value| format!(" data-rs-cad-clip=\"{}\"", escape(&value)))
+                            .map(|value| {
+                                clip_id += 1;
+                                let id = format!("rs-cad-clip-{clip_id}");
+                                writeln!(
+                                    defs,
+                                    "<clipPath id=\"{id}\"><path d=\"{}\"/></clipPath>",
+                                    escape(&value)
+                                )
+                                .unwrap();
+                                format!(" clip-path=\"url(#{id})\"")
+                            })
                             .unwrap_or_default();
                         if transform.is_empty() {
                             writeln!(svg, "<g{clip}>").unwrap();
@@ -402,6 +414,9 @@ pub fn render_dwfx_page<R: Read + Seek>(
             return Err(Error::SvgTooLarge);
         }
         buffer.clear();
+    }
+    if !defs.is_empty() {
+        svg = svg.replacen("><rect", &format!("><defs>{defs}</defs><rect"), 1);
     }
     svg.push_str("</svg>\n");
     Ok((
